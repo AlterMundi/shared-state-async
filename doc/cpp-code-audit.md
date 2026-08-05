@@ -1,0 +1,235 @@
+# C++ Codebase Audit — Correctness & Performance Findings
+
+Status: code review of the current C++ implementation (master @ `ce8659b`),
+done as groundwork for the Rust port (see `rust-port-plan.md`).
+Motivation: field performance has never been smooth, and the upstream
+tracker confirms it — this audit ties the reported symptoms to root causes
+in the code.
+
+Referenced upstream reports:
+
+- [shared-state-async PR #1](https://github.com/libremesh/shared-state-async/pull/1)
+  — "Workaround for likely memory managment bug" (a debug printout that
+  makes a hang disappear)
+- [lime-packages #1198](https://github.com/libremesh/lime-packages/issues/1198)
+  — `discover` hangs on x86-64/GCC 12
+- [lime-packages #1105](https://github.com/libremesh/lime-packages/issues/1105)
+  — insert rate / silent insert failures
+- [lime-packages #1129](https://github.com/libremesh/lime-packages/issues/1129)
+  — state refresh too slow after mesh upgrade
+- [lime-packages #1150](https://github.com/libremesh/lime-packages/issues/1150)
+  — log floods incl. "Connection refused" storms and "is remote peer ill?"
+- [lime-packages #1220](https://github.com/libremesh/lime-packages/issues/1220)
+  — poor responsiveness of shared-state plugins
+
+## A. Critical — undefined behavior in the coroutine machinery
+
+### A1. Coroutine frame destroyed while its `resume()` is still on the stack
+
+`include/task.hh` implements awaiting without symmetric transfer:
+`task::await_suspend` calls `child.resume()` directly, and the child's
+`final_awaiter::await_suspend` calls `waiter.resume()` directly.
+
+When an awaited coroutine completes **synchronously** (without ever
+suspending — e.g. the `closeAFD`/`CloseOperation` chain, where close(2)
+never suspends by design, or any error path that returns before the first
+real I/O await), the sequence is:
+
+1. Parent P: `co_await childTask` → P suspends → `task::await_suspend`
+   calls `child.resume()`.
+2. Child runs to completion inside that call, reaches `final_suspend`,
+   and `final_awaiter::await_suspend` **resumes P while `child.resume()`
+   is still on the stack**.
+3. P continues executing; when it passes the end of the `co_await`
+   full-expression, the `task` temporary's destructor runs, sees
+   `done() == true`, and calls `mCoroutineHandle.destroy()` — **freeing
+   the child's coroutine frame while the child's `resume()` invocation is
+   still active below on the native stack**.
+4. When P later suspends (or completes), the stack unwinds back through
+   the destroyed child's coroutine machinery.
+
+Whether step 4 touches freed memory depends on compiler codegen and frame
+layout — which is exactly why upstream #1198 manifests only on certain
+GCC/arch combinations and why inserting a single `RS_DBG(...)` printout in
+`closeAFD` (PR #1) makes it disappear: it perturbs frame layout, not the
+bug. The in-tree comments corroborate that lifetime is not under control:
+`io_context.cc` "NEED a FULL blown shared_ptr copy here, I haven't fully
+understood yet why taking just a reference … cause invalid memory read",
+and `shared_state_cli.cc` cannot spawn concurrent handlers because
+detached-task lifetime is unsafe (see B1).
+
+The standard fix is symmetric transfer (`await_suspend` returning
+`std::coroutine_handle<>`), which every mature C++ coroutine library uses.
+For the Rust port this entire class of bug disappears with the borrow
+checker + a real runtime.
+
+### A2. Nested resumption also means unbounded native-stack recursion
+
+The same direct-`resume()` design nests one native stack frame per level
+of coroutine chaining per completion cascade. Deep chains
+(`syncWithPeer` → `sendNetworkMessage` → `AsyncSocket::send` →
+`SendOperation` …) unwind recursively. On desktop this is slow; on
+small-stack embedded threads it is a latent stack overflow.
+
+### A3. Exceptions are silently swallowed, results become garbage
+
+`promise_type_base::unhandled_exception() {}` drops any exception; the
+coroutine then "completes" without `return_value()` ever being called, and
+`await_resume()` returns a default-initialized (for scalar types:
+**indeterminate**) result to the caller. Any throwing code path inside a
+coroutine produces silent wrong results instead of a crash or an error.
+
+## B. Critical — availability: the daemon serves one peer at a time, forever waits
+
+### B1. Accept loop is fully serial
+
+`shared_state_cli.cc` `acceptReqSyncConnectionsLoop()` does
+`co_await handleReqSyncConnection(socket)` inline: the next `accept()`
+does not happen until the previous client's entire handshake → receive →
+merge → send → close cycle finishes. The listen backlog is 8
+(`async_socket.hh`). Under mesh load, concurrent peers get **connection
+refused** — matching the `ConnectOperation … Connection refused` storms in
+lime-packages #1150 — and propagation latency serializes across the whole
+neighborhood (#1129, #1220). The code comment shows this was forced by A1:
+detaching the handler task is not memory-safe in this machinery.
+
+### B2. No timeout on any network operation
+
+Neither connect, nor recv, nor send, nor the handshake have any deadline;
+`AsyncTimer` exists but is never composed with I/O. Consequences on a
+lossy wireless mesh:
+
+- An accepted client that goes silent mid-protocol (no FIN, no RST — the
+  normal failure mode of a flaky radio link, and no TCP keepalive is set)
+  parks `handleReqSyncConnection` **forever**. Combined with B1, one
+  wedged connection permanently stops the daemon from accepting any new
+  sync request. This is the highest-impact availability defect in the
+  codebase.
+- Outbound `connect()` to a blackholed peer stalls the serial publish
+  loop in `peer()` for the kernel SYN-retry time (minutes) per dead peer,
+  per data type.
+
+### B3. Publish rounds are skipped under load
+
+`peer()`'s scheduler wakes every 999 ms and publishes only when
+`now % updateInterval == 0` (in whole seconds). If an iteration is
+delayed past that exact second — e.g. by B2 stalls — the round is skipped
+entirely until the next interval. Under load, updates become sparse
+exactly when the mesh most needs them (#1129).
+
+### B4. A transient `accept()` failure kills the daemon
+
+`ListeningSocket::accept()` never checks the FD returned by
+`AcceptOperation` for `-1`; failure feeds `-1` into `registerFD`, whose
+`fcntl` fails and — with no error bubble passed — the error handler
+**exits the process**. `accept(2)` can fail transiently with
+`ECONNABORTED`, `EMFILE`, `ENFILE` on any busy router; each such event is
+currently fatal to the whole shared-state daemon.
+
+## C. High — protocol/domain logic defects
+
+### C1. The #1105 fix was never actually wired in (dead variable)
+
+Commit `db58e3d` ("More robust bleaching and merge") introduced in
+`SharedState::merge()`:
+
+```cpp
+const auto minUpdateTtl = (isRemote && ownAuthorship) ?
+            knownEntry.mTtl + std::chrono::seconds(1) : knownEntry.mTtl;
+
+if( sliceEntry.mTtl >= knownEntry.mTtl )   // <-- minUpdateTtl unused!
+```
+
+`minUpdateTtl` is computed and never used; the guard it was meant to
+implement ("avoid overwrite of own entries from remote peers when TTL is
+equal") has been dead code since the day it was written. Remote peers
+echoing back this node's own entries at equal TTL silently overwrite the
+local (potentially fresher) data, and every equal-TTL echo counts as a
+change and re-inserts the entry. **Port decision required:** implement
+the *intended* semantics (`>= minUpdateTtl`), not the actual ones —
+flagged in `rust-port-plan.md`.
+
+### C2. Hostname re-read from /proc for every entry of every merge
+
+`authorPlaceOlder()` opens and reads `/proc/sys/kernel/hostname` on each
+call, and `merge()` calls it **once per received entry** to test
+authorship. A sync of a few hundred entries costs hundreds of
+open/read/close cycles — on every sync, on a MIPS router. Cache it once.
+
+### C3. Map churn and deep copies on no-op merges
+
+For every incoming entry with `mTtl >= known` — including byte-identical
+gossip echoes, the common case — `merge()` does `erase` + `emplace`,
+deep-copying the rapidjson DOM (`StateEntry` copy ctor does `CopyFrom`).
+Steady-state gossip therefore performs continuous allocator churn
+proportional to state size × peers × sync frequency.
+
+### C4. Division by zero in bandwidth estimation
+
+`MbitPerSec(bytes, microseconds)` computes `(bytes<<3)/microseconds`. The
+guard checks `recvETP > recvBTP`, but a sub-microsecond transfer (small
+message on loopback — and every CLI operation goes through loopback)
+floors to **0 µs after `duration_cast`, giving integer division by zero**
+(SIGFPE, instant crash). Needs `max(1, µs)`.
+
+### C5. Child exit status ignored
+
+`AsyncCommand::waitTermination` discards `wstatus` (in-code TODO). A
+failing `shared-state-async-discover` (missing script, script error)
+looks identical to "zero neighbours discovered": `discover`/`peer`
+silently operate on an empty peer list instead of reporting the failure.
+
+## D. Medium — resource handling
+
+### D1. FDs leak into child processes (no CLOEXEC)
+
+Only the timerfd and the stats file are opened with CLOEXEC. The epoll
+FD, the listening socket, every peer socket, and both pipe ends are
+inherited by every hook script and by `shared-state-async-discover`. A
+hook that daemonizes or lingers holds port 3490 open (blocking daemon
+restart) and holds pipe ends open (preventing EOF detection). All FDs
+should be `SOCK_CLOEXEC`/`O_CLOEXEC`/`EPOLL_CLOEXEC`.
+
+### D2. Short-read results unchecked at protocol layer
+
+`AsyncSocket::recv` loops correctly, but returns a short count on peer
+EOF; `receiveNetworkMessage` adds `recvRet` to totals without checking it
+equals the requested length. A peer disconnecting mid-header yields a
+partially-filled length field interpreted as valid data — caught later
+only by luck (JSON parse failure or the length bounds check).
+
+### D3. Per-operation epoll_ctl churn and O(all-FDs) scan per loop tick
+
+Every `RecvOperation`/`SendOperation` constructor/destructor toggles
+watch flags, and `IOContext::run()` re-scans **all** managed FDs after
+every `epoll_wait` batch to apply `EPOLL_CTL_MOD`. Cost grows with
+concurrent FDs, wasted almost always (state usually unchanged, guarded by
+compare — but the scan itself is unconditional).
+
+### D4. Fragile EINTR handling
+
+The `epoll_wait` EINTR-retry in `io_context.cc` is compiled only because
+that file happens to pin `RS_DEBUG_LEVEL` to 1 (`#if RS_DEBUG_LEVEL > 0`
+around the retry). Lowering the file's debug level would silently turn
+any EINTR into daemon exit. EINTR handling must be unconditional.
+
+## E. Implications for the Rust port
+
+Ranked by what the port must do *differently* rather than translate:
+
+1. **Concurrency model (fixes B1/B2/B3):** spawn one task per accepted
+   connection; wrap every network I/O and subprocess await in a timeout
+   (`async-io::Timer` + `futures_lite::future::or`); keep publish
+   scheduling on elapsed-time arithmetic, not modulo-second matching.
+   This is a deliberate behavior improvement, not a wire change.
+2. **Merge semantics (C1):** implement the *intended* equal-TTL guard;
+   document the delta from the C++ binary's actual behavior.
+3. **Free fixes by construction:** A1/A2/A3 vanish with a real async
+   runtime; D1 via Rust std (sockets/files are CLOEXEC by default);
+   C4 via a `max(1, µs)`; C2 via caching hostname at startup; C5 by
+   checking `ExitStatus`.
+4. **Behavior to keep bug-for-bug:** wire format, JSON key names, stats
+   file shape, hook contract, CLI verbs — per `rust-port-plan.md` §9.
+5. **Validation note:** because B1–B3 change externally observable
+   *timing* (not format), mixed-fleet testing in M5 should specifically
+   watch for convergence-rate asymmetries between Rust and C++ nodes.

@@ -199,6 +199,13 @@ transparently, which matters for any staged rollout across a live mesh.
 
 ## 8. Open risks / decisions
 
+- **Known defects in the C++ implementation** are catalogued in
+  [`cpp-code-audit.md`](cpp-code-audit.md). The port must NOT translate
+  them: notably the serial accept loop + missing I/O timeouts (root cause
+  of most field slowness), and `merge()`'s dead `minUpdateTtl` guard —
+  the Rust `merge` implements the *intended* equal-TTL protection from
+  commit `db58e3d`, with the behavior delta documented.
+
 - **MIPS/musl feed maturity** — needs a direct check against real target
   boards before Phase 5, not just the packages-feed PR history.
 - **`AsyncFileDescriptor`'s pending-op queue** (`include/async_file_descriptor.hh:143`
