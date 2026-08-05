@@ -1,5 +1,15 @@
 # Rust Port: Architecture Mapping & Refactor Plan
 
+> **⚠️ Read together with [`refactor-critique.md`](refactor-critique.md)**,
+> an adversarial review of this plan. Its main challenges: (Gate 0) MIPS
+> Tier-3 Rust support may disqualify the port for the dominant deployed
+> hardware — verify board inventory before writing any Rust; (M-1) a
+> protocol spec + property tests + multi-node simulation must precede
+> M0, because the Python black-box tests pass against every known bug;
+> and a C++ stabilization track (with javierbrk) should ship fleet fixes
+> before the port reaches parity. This plan's M0–M5 remain valid but are
+> gated and re-sequenced by that document.
+
 Status: research / planning — no Rust code written yet.
 Scope: full rewrite (not FFI bridging) of the `shared-state-async` daemon,
 preserving the existing wire protocol so it stays interoperable with any
