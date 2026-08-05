@@ -24,7 +24,6 @@ epoll loop.
 | Subprocess + waitpid | `AsyncCommand` / `waitpid_operation.cc` | `async-process` (smol-family) — or raw `nix::sys::wait::waitpid` for 1:1 control | Async stdin/stdout + child reaping without pulling in tokio |
 | JSON | rapidjson + `RsJson` wrapper | `serde_json` | Deletes the `RsJson`/`RsTypeSerializer` glue entirely; DOM-parse perf difference is irrelevant at this message size |
 | sockaddr / socket utils | libretroshare `rsnet`/`rsnet_ss` | `socket2` (native `SockAddrStorage`) | Same low-level control, no vendored dependency |
-| base64 | libretroshare `rsbase64` | `base64` crate | — |
 | Stacktrace | vendored cpptrace | `std::backtrace` (stable) | Built into std, no extra dependency |
 | Serialization framework | `RsSerializable` / `RsTypeSerializer` | `serde::{Serialize, Deserialize}` derives | Replaces hand-written `serial_process()` methods with derive macros |
 | CLI arg parsing | hand-rolled in `shared_state_cli.cc` | `clap` (derive API) | — |
@@ -35,8 +34,19 @@ of sockets, subprocess pipes, and timers on routers with tens of MB of RAM.
 Full tokio brings a scheduler and feature surface this doesn't use; the smol
 stack (`async-io`/`async-executor`/`async-process`) mirrors the current
 single-threaded reactor almost 1:1 at a much smaller footprint. io_uring
-runtimes (monoio) are irrelevant — router kernels are old and the I/O pattern
-doesn't benefit from it.
+runtimes (monoio) are irrelevant — the I/O pattern (a handful of FDs) doesn't
+benefit from it. Note the current code already requires kernel ≥ 5.3
+(`pidfd_open` in `async_command.cc`), so kernel age is not the constraint;
+binary size and RAM are.
+
+**Subprocess semantics to preserve** (`src/async_command.cc`): command
+strings are whitespace-tokenized and `execvp`'d directly — **no shell**.
+`command.rs` must do split + `Command::args`, not `sh -c`, or hook and
+discover invocation behavior changes. Child termination is awaited via
+`pidfd_open` registered in epoll; if strict single-threadedness matters,
+verify `async-process`'s reaping strategy on the pinned version (some
+configurations spawn a helper thread) — the 1:1 alternative is `nix` +
+pidfd wrapped in `Async<OwnedFd>`.
 
 **Net effect of dependency swap**: dropping the vendored `libretroshare`
 FetchContent (currently the biggest build-time/cross-compile cost in
@@ -75,7 +85,7 @@ surface.
 |---|---|---|---|
 | `include/sharedstate.hh` + `src/sharedstate.cc` | 282+1106 | `sharedstate.rs` (or split: `protocol.rs`, `state.rs`, `stats.rs`) | Core of the actual port effort — merge/bleach/handshake/hooks logic, `serde`-derived `StateEntry`/`DataTypeConf`/`NetworkMessage`/`NetworkStats` |
 | `include/shared_state_errors.hh` + `src/shared_state_errors.cc` | 68+24 | `error.rs` using `thiserror` | Replace `std::error_condition` bubbling with `Result<T, SharedStateError>` |
-| `app/shared_state_cli.hh` + `app/shared_state_cli.cc` | 72+337 | `cli.rs` + `bin/shared-state-async.rs` | `clap`-derived subcommands: `discover`, `dump`, `get`, `insert`, `peer`, `register-data-type`, `sync` |
+| `app/shared_state_cli.hh` + `app/shared_state_cli.cc` | 72+337 | `cli.rs` + `bin/shared-state-async.rs` | `clap`-derived subcommands matching the existing verbs exactly: `discover`, `dump`, `get`, `insert`, `peer`, `register`, `sync` (see `app/shared-state-async.cc`) |
 | `app/shared-state-async.cc` | 153 | `main.rs` | Entry point, arg dispatch, executor setup |
 
 ### Build / packaging
@@ -94,7 +104,7 @@ shared-state-async/
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs            # entry point, executor setup, arg dispatch
-│   ├── cli.rs              # clap subcommands (discover/dump/get/insert/peer/sync)
+│   ├── cli.rs              # clap subcommands (discover/dump/get/insert/peer/register/sync)
 │   ├── net.rs              # AsyncSocket/ListeningSocket/ConnectingSocket equivalents
 │   ├── command.rs          # async subprocess exec + waitpid wrapper
 │   ├── protocol.rs          # wire format: NetworkMessage encode/decode
@@ -141,9 +151,22 @@ test.
 
 **M2 — Wire protocol**
 Port `NetworkMessage` framing (`protocol.rs`) and `serde`-derived
-`StateEntry`/`DataTypeConf`/`NetworkStats`. Exit criteria: round-trip
-encode/decode unit tests pass, and the new binary can complete a handshake
-with itself.
+`StateEntry`/`DataTypeConf`/`NetworkStats`.
+
+⚠️ **Interop-critical**: the payload JSON is produced by libretroshare's
+`RsTypeSerializer` with keys equal to the C++ member names — `"mAuthor"`,
+`"mTtl"`, `"mData"` — and the state slice is wrapped in an object whose outer
+key is literally `"stateSlice"` (see the `fromStateSlice`/`toStateSlice`
+comments in `src/sharedstate.cc` warning to keep the parameter name stable).
+Plain serde derives produce different keys and no wrapper: the handshake
+would succeed and merge would silently exchange nothing against C++ peers.
+The Rust types need explicit `#[serde(rename = "...")]` attributes plus a
+wrapper struct, driven by **golden payload fixtures captured from the C++
+binary before any Rust encoder is written**.
+
+Exit criteria: round-trip encode/decode tests pass against the captured C++
+golden fixtures (not just Rust-to-Rust), and the new binary can complete a
+handshake with itself.
 
 **M3 — Domain logic**
 Port `merge`, `bleach`, `notifyHooks`, `syncWithPeer`,
@@ -156,7 +179,8 @@ against the new binary.
 **M4 — CLI parity**
 Port `shared_state_cli.cc`'s subcommands via `clap`. Exit criteria: CLI
 output byte-for-byte (or intentionally-noted-different) compared against the
-C++ binary for `discover`, `dump`, `get`, `insert`, `peer`, `sync`.
+C++ binary for `discover`, `dump`, `get`, `insert`, `peer`, `register`,
+`sync`.
 
 **M5 — Cross-compile & packaging**
 Static musl builds per target architecture, OpenWrt package Makefile, deploy
@@ -190,6 +214,12 @@ transparently, which matters for any staged rollout across a live mesh.
 - **Hooks directory / config file paths** (`/usr/share/shared-state/hooks/`,
   `/tmp/shared-state/shared-state-async.conf`) are hardcoded `constexpr`
   paths — carry over as-is for interop, don't "improve" them mid-port.
+- **`shared-state-async-discover` external helper** —
+  `getCandidatesNeighbours()` execs this command (a separate LibreMesh
+  script expected on `PATH` on the router) and parses one peer address per
+  line from its stdout. This runtime dependency survives the port unchanged,
+  and the M3 python-client exit criteria do **not** exercise it on a dev
+  machine — it needs its own smoke test in M5 on-target.
 
 ## 9. Non-goals
 
@@ -197,5 +227,10 @@ transparently, which matters for any staged rollout across a live mesh.
   replacement binary, not a protocol v2.
 - No changes to hook script contract, config file format, or CLI subcommand
   names/semantics.
+- No changes to the on-disk `/tmp/shared-state/network_statistics.json`
+  format: it is written with wrapper key `"stats"` and the same
+  member-name key convention as the wire payload, and is consumed by other
+  LibreMesh tooling for bandwidth-aware routing decisions — it is an
+  external contract, and gets a golden-fixture test like the wire format.
 - No introduction of tokio or a multi-threaded scheduler unless a concrete
   performance need is identified post-port.
