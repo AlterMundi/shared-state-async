@@ -202,9 +202,17 @@ transparently, which matters for any staged rollout across a live mesh.
 - **Known defects in the C++ implementation** are catalogued in
   [`cpp-code-audit.md`](cpp-code-audit.md). The port must NOT translate
   them: notably the serial accept loop + missing I/O timeouts (root cause
-  of most field slowness), and `merge()`'s dead `minUpdateTtl` guard —
-  the Rust `merge` implements the *intended* equal-TTL protection from
-  commit `db58e3d`, with the behavior delta documented.
+  of most field slowness).
+- **Merge algorithm**: TTL-as-freshness is a protocol design flaw
+  (audit C6) — nodes end up preferring stale external echoes over their
+  own fresh measurements. The Rust `merge` should implement the
+  version-counter algorithm from javierbrk's
+  [`merge_with_version`](https://github.com/javierbrk/shared-state-async/tree/merge_with_version)
+  branch (per-entry author-incremented `mVersion` + reboot recovery),
+  coordinated with him so C++ and Rust ship the same semantics and wire
+  field. This is the one sanctioned wire-payload addition (see §9) and
+  needs an explicit mixed-fleet rollout decision (old nodes = version 0),
+  ideally with a `WIRE_PROTO_VERSION` bump.
 
 - **MIPS/musl feed maturity** — needs a direct check against real target
   boards before Phase 5, not just the packages-feed PR history.
@@ -231,7 +239,9 @@ transparently, which matters for any staged rollout across a live mesh.
 ## 9. Non-goals
 
 - No protocol/wire-format changes in this port — goal is a drop-in
-  replacement binary, not a protocol v2.
+  replacement binary, not a protocol v2. Single sanctioned exception:
+  the `"mVersion"` payload field from the version-counter merge (§8),
+  which old nodes safely ignore.
 - No changes to hook script contract, config file format, or CLI subcommand
   names/semantics.
 - No changes to the on-disk `/tmp/shared-state/network_statistics.json`

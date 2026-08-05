@@ -179,6 +179,63 @@ failing `shared-state-async-discover` (missing script, script error)
 looks identical to "zero neighbours discovered": `discover`/`peer`
 silently operate on an empty peer list instead of reporting the failure.
 
+## C6. Protocol design flaw — TTL conflates expiry with freshness (no versioning)
+
+Beyond the dead-variable bug in C1, the merge algorithm has a deeper
+design problem: **remaining TTL is the only freshness signal**, and TTL
+is not a version. There is no timestamp, counter, or any mechanism that
+allows precise "which state is newest" comparison between nodes.
+
+Concrete corruption scenario (pointed out by javierbrk from field
+experience): a node measures its own local conditions and publishes them,
+but is too slow processing incoming syncs (see B1–B3 — slowness is the
+norm under load). Meanwhile its earlier entries echo back from neighbors
+with equal-or-higher remaining TTL — because each node bleaches on its
+own clock, remote copies of an entry routinely carry *higher* TTL than
+the author's own copy. The `>=` merge rule then makes the author **prefer
+the stale external echo over its own fresher measurement**. The node's
+state is now corrupt with respect to reality it can directly observe, and
+it re-propagates the stale data as if fresh. Convergence becomes
+order-dependent and can oscillate rather than settle.
+
+### javierbrk's fix: version counters (`merge_with_version` branch)
+
+[`javierbrk/shared-state-async` branch `merge_with_version`](https://github.com/javierbrk/shared-state-async/tree/merge_with_version)
+(key commit `522f59d5` "add version number instead of ttl for merge
+algorithm") replaces TTL-as-freshness with a per-entry, author-incremented
+monotonic counter:
+
+- `StateEntry` gains `uint64_t mVersion`, serialized as `"mVersion"`
+  in the wire payload; the author increments it on each insert
+  (`insert()` pre-syncs with the local peer to learn current versions).
+- `merge()` accepts an entry only if `mVersion` is strictly higher;
+  at equal version, higher TTL wins (TTL demoted to expiry/tie-break).
+- **Reboot recovery**: state lives in `/tmp`, so counters are lost on
+  reboot. When a node receives its *own-authored* entry back with a
+  higher version than it knows, it keeps its own (freshly measured) data
+  and adopts `remote version + 1`, so the next sync propagates its data
+  mesh-wide. This directly encodes "own measured conditions beat external
+  echoes."
+
+Design assessment: a Lamport-style counter is the right call for this
+environment — mesh routers have no RTC and unreliable NTP, so wall-clock
+timestamps would be *worse* than TTL, not better. Notes for adoption:
+
+- **It is a wire-payload change** (a new `"mVersion"` key). Old nodes
+  ignore the unknown key and keep comparing by TTL; new nodes see
+  entries from old nodes as version 0. A mixed fleet therefore degrades
+  to roughly the old behavior until fully upgraded — acceptable, but it
+  should be an explicit rollout decision, ideally paired with a
+  `WIRE_PROTO_VERSION` bump (currently 1, exchanged in the handshake but
+  never acted upon).
+- At equal version with *different* data (two nodes writing independently
+  after reboots), the TTL tie-break silently picks one copy and does not
+  count it as a significant change, so hooks don't fire on that
+  transition — a small observability gap.
+- The branch's history also independently confirms B1/B2: commit
+  `c464cfb7` "intial sinc is useless and generates deadlok at startup" —
+  the insert pre-sync deadlocked against the busy serial accept loop.
+
 ## D. Medium — resource handling
 
 ### D1. FDs leak into child processes (no CLOEXEC)
@@ -222,8 +279,12 @@ Ranked by what the port must do *differently* rather than translate:
    (`async-io::Timer` + `futures_lite::future::or`); keep publish
    scheduling on elapsed-time arithmetic, not modulo-second matching.
    This is a deliberate behavior improvement, not a wire change.
-2. **Merge semantics (C1):** implement the *intended* equal-TTL guard;
-   document the delta from the C++ binary's actual behavior.
+2. **Merge semantics (C1 + C6):** the port should implement
+   version-counter merge (javierbrk's `merge_with_version` design) rather
+   than either the actual or the intended TTL-based semantics —
+   coordinate with javierbrk so C++ and Rust land the same algorithm and
+   wire field, and decide the mixed-fleet rollout (old nodes = version 0)
+   explicitly, ideally with a `WIRE_PROTO_VERSION` bump.
 3. **Free fixes by construction:** A1/A2/A3 vanish with a real async
    runtime; D1 via Rust std (sockets/files are CLOEXEC by default);
    C4 via a `max(1, µs)`; C2 via caching hostname at startup; C5 by
