@@ -1,14 +1,17 @@
 # Rust Port: Architecture Mapping & Refactor Plan
 
 > **⚠️ Read together with [`refactor-critique.md`](refactor-critique.md)**,
-> an adversarial review of this plan. Its main challenges: (Gate 0) MIPS
-> Tier-3 Rust support may disqualify the port for the dominant deployed
-> hardware — verify board inventory before writing any Rust; (M-1) a
-> protocol spec + property tests + multi-node simulation must precede
-> M0, because the Python black-box tests pass against every known bug;
-> and a C++ stabilization track (with javierbrk) should ship fleet fixes
-> before the port reaches parity. This plan's M0–M5 remain valid but are
-> gated and re-sequenced by that document.
+> an adversarial review of this plan. Standing decisions from it:
+> **Gate 0 resolved** — the fielded fleet is 100% LibreRouter v1 (ath79
+> big-endian MIPS, Rust Tier 3, 16 MB flash), so this port is a
+> *reference implementation + v2/data(t) substrate*, NOT the fleet fix;
+> the C++ stabilization track (with javierbrk) is the fleet deliverable.
+> **M-1 precedes M0**: protocol spec + golden fixtures + property tests
+> + multi-node simulation with freshness (AoI) metrics — the Python
+> black-box tests pass against every known bug and validate nothing.
+> The spec + fixtures are an upstream collaboration deliverable
+> (critique §3.7), and the strategic G(t)/`data(t)` context (critique
+> §5) sets design directives for the v2 protocol module.
 
 Status: research / planning — no Rust code written yet.
 Scope: full rewrite (not FFI bridging) of the `shared-state-async` daemon,

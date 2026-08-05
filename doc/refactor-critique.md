@@ -124,13 +124,18 @@ MIPS: ath79 (LibreRouter v1, TL-WDR3600 — big-endian MIPS 74Kc/24Kc) and
 ramips/MT76xx (mipsel). If the fleet inventory is MIPS-heavy, the Rust
 port as planned is high-risk **precisely for the devices that matter**.
 
-This must become an explicit *Gate 0 — before any Rust code*:
-inventory actual deployed boards (AlterMundi networks + LibreRouter v2
-SoC), check current Rust tier status, and produce a working
-`opkg`-installable hello-world on the *oldest* fielded board. If Gate 0
-fails, the fallback is not "try harder": it is Track 1 below (C++
-stabilization) as the deliverable, with Rust deferred to ARM-era
-hardware.
+**Gate 0 status: RESOLVED (2026-08-05, fleet input from Fede).** All
+in-service devices are LibreRouter **v1** — QCA9558 ath79, big-endian
+MIPS 74Kc, 16 MB flash / 128 MB RAM. LibreRouter 2 (MediaTek-candidate
+SoC) is a lab-only design with nothing fielded. Consequence: **the Rust
+port cannot be the fleet fix.** 100% of production hardware sits on a
+Rust Tier-3 target with a 16 MB flash budget. The port is re-scoped to:
+(a) reference implementation of the protocol spec, validated on
+x86/testbed and LR2-era lab hardware; (b) the substrate for the v2 /
+`data(t)` direction (§5); (c) fleet deployment only if/when a Tier-3
+MIPS-musl build is proven on a real LR1 — treated as an experiment, not
+a milestone. Track 1 (C++ stabilization) is therefore **the** fleet
+deliverable, not a stopgap.
 
 ### 3.2 The validation plan validates nothing
 
@@ -147,7 +152,17 @@ corresponding port milestone:
 - Multi-node simulation: N in-process nodes, injected packet loss,
   reordering, slow nodes, reboots (version-counter loss!), clock skew.
   The C6 corruption class is *only* visible here — it was found in the
-  field because no such harness exists.
+  field because no such harness exists. G10h4ck's field note
+  (`ardc-2024-report/research/shared-state-merge-strategy/`) contains
+  the exact target artifact: a simultaneous 4-node TTL-divergence
+  snapshot showing 22–27 s windows in which an author cannot update its
+  own entries. The harness must reproduce that table synthetically —
+  and then show the version-counter merge eliminates it.
+- **Freshness metrics as first-class outputs**, not just final-state
+  equality: per-entry staleness distributions across nodes — in Age of
+  Information terms, P(staleness ≤ t) curves over the gossip layer.
+  Convergence-of-value says nothing about convergence-in-time, and the
+  `data(t)` use case (§5) makes time the requirement.
 - Chaos/soak: hung peers mid-protocol, hooks that block/fail/daemonize,
   malformed discovery output, torn config writes.
 
@@ -206,6 +221,64 @@ sequencing is two coordinated tracks:
 Track 1 is not wasted work for Track 2 — it is how the golden fixtures
 and the merge semantics get field-validated before being spec-frozen.
 
+## 3.7 The spec + fixtures are a collaboration deliverable, not internal docs
+
+The protocol spec and golden fixtures (§0) should be written *for*
+upstream — concretely for javierbrk, who is carrying the effort of
+getting a minimum workable merge algorithm into the field. Deliverable
+form: a spec PR against `libremesh/shared-state-async` `doc/`, fixture
+files capturable/verifiable with a small script against any running
+binary (C++ master, `merge_with_version`, or the future Rust one), and
+the property-test suite runnable against all three. That makes the spec
+the *shared reference* the C++ and Rust tracks both answer to, instead
+of AlterMundi-fork documentation the C++ maintainers never see.
+
+## 5. Strategic context: shared-state as the `data(t)` bus (ARDC research)
+
+Fede's analysis in `~/REPOS/ardc-2024-report/research/` (esp.
+`esp32-medium-coordination/07-modelado-del-grafo-de-conflicto.md` and
+`08-shared-state-bus-data-t.md`) reframes what this daemon is *for*, and
+therefore what the refactor must protect:
+
+- **Thesis:** next-gen LibreMesh needs a time-varying topology/conflict
+  graph **G(t)** for field coordination — feeding both a human/AI
+  operator plane and, eventually, low-level medium-access scheduling
+  (MW-CA-RF). The `data(t)` stream that estimates G(t) needs a
+  distributed substrate, and shared-state *is* that substrate — "not in
+  its actual state."
+- **Two-plane split (the architecture that makes this sane):** a slow
+  model plane (seconds–minutes: G(t) edges, telemetry — shared-state
+  gossip, eventual consistency, staleness-tolerant) and a fast execution
+  plane (sub-second slot decisions — local, authoritative, explicitly
+  NOT shared-state). Shared-state feeds the scheduler's *model*, never
+  its per-slot *decisions*.
+- **Consequence for this repo:** the TTL-convergence defect (C6) is
+  promoted from annoyance to **correctness prerequisite** — divergent
+  G(t) between coordinators means scheduling on inconsistent graphs
+  (double-assignment/collisions). The merge fix and the freshness
+  guarantees stop being Data-Collection hygiene and become a dependency
+  of the MW-CA-RF workstream.
+- **Design directives the v2 module (§3.3) inherits from that analysis:**
+  1. Optimize the ephemeral-event path for **Age of Information**, not
+     send rate — "gossip as fast as possible" provably does not yield
+     the freshest state.
+  2. **Differentiated consistency per data type on the same bus**: lax
+     eventual for telemetry; stronger *local* consistency (within the
+     collision domain's neighbor set, never network-wide) for G(t)
+     edges. The existing per-type config (`DataTypeConf.mScope`) is the
+     natural hook for this.
+  3. A CRDT gets convergence-of-value only; semantic conflicts (two
+     coordinators claiming one cell) need a deterministic policy layer
+     above the merge — out of scope for shared-state, but the spec must
+     not preclude it.
+- **What this does NOT change:** none of the v1-parity scope. It raises
+  the stakes of doing the spec + test harness right, because the same
+  merge semantics will eventually sit under a control loop. The ARDC
+  docs describe this substrate as "shared-state v3 Rust/`smol`" — i.e.
+  the port plan's runtime choice is already assumed by that roadmap;
+  what must be added to it is the freshness-metric work (AoI/PBS), which
+  neither the C++ code nor our plan currently contemplates.
+
 ## 4. Disposition table
 
 | # | Challenge | Action required |
@@ -217,9 +290,11 @@ and the merge semantics get field-validated before being spec-frozen.
 | 1.4 | Expiry never fires hooks | Spec decision + fix in both tracks |
 | F1 | Config wipe race (every second) | Fix in C++ now (temp+rename); same in Rust |
 | F3 | Discovery all-or-nothing | Skip bad lines + check exit status, both tracks |
-| 3.1 | MIPS Tier 3 may disqualify Rust | Gate 0: board inventory + toolchain proof on oldest board |
+| 3.1 | MIPS Tier 3 may disqualify Rust | **RESOLVED: fleet is 100% LR1 ath79 MIPS → C++ track is the fleet fix; Rust = reference impl + v2 substrate** |
 | 3.2 | Python tests validate nothing | Property tests + multi-node simulation harness (M-1) |
 | 3.3 | Wire-compat value trap | v1 interop + v2-ready internals; reword §9 non-goal |
 | 3.4 | Unbounded spawn = memory DoS | Backpressure limits in port design |
 | 3.5 | No ops scope | procd, logging, canary, revert path into plan |
 | 3.6 | Port is not the urgent fix | Two-track: C++ stabilization first, in coordination with javierbrk |
+| 3.7 | Spec is a collaboration deliverable | Spec + fixtures as upstream PR, runnable against C++/version-branch/Rust |
+| 5 | Shared-state is the future data(t)/G(t) bus | Merge fix + freshness metrics (AoI/PBS) are prerequisites for MW-CA-RF; v2 design inherits AoI + differentiated-consistency directives |
