@@ -1,0 +1,12 @@
+{
+    "conflict-probe": {
+        "t": 1
+    },
+    "probe-key-1": {
+        "hostname": "testhost",
+        "n": 42
+    },
+    "probe-key-2": {
+        "origin": "python-codec"
+    }
+}

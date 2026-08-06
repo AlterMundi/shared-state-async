@@ -63,9 +63,31 @@ spec-relevant behavioral difference and belongs in
 propagation p95, lockouts, regressions) are reported for every scenario
 × strategy × seed even where not gated — trend them when tuning.
 
-## Not yet done (needs a built C++ binary)
+## Golden fixtures — CAPTURED ✅
 
-Golden-fixture capture (spec §10): run `wire.py sync` against a real
-`shared-state-async peer` on loopback and store the raw bytes under
-`fixtures/captured/`. Until then the payload JSON layout in `wire.py`
-is the spec's ⚠️UNVERIFIED best guess; the model semantics are unaffected.
+`fixtures/captured/` holds byte-exact captures from a real binary
+(gcc 14.2 Release, x86-64, 2026-08-06) via `capture.py`:
+
+```
+python3 capture.py server                  # impersonate the daemon, capture real CLI bytes
+python3 capture.py client <ip> <type>      # drive a real daemon, capture its bytes
+```
+
+Interop is proven both ways: our codec's frames were accepted, merged
+and re-served by the daemon, and the daemon's frames decode cleanly
+here. `wire.py`'s payload layout is therefore **verified**, not guessed.
+
+Capture-time discoveries now in the spec:
+
+- handshake msg3 is echoed with **platform byte order** (double
+  `htonl`) — never validate it (spec §3)
+- `xint64` beats `xstr64` when they disagree (spec §6.7)
+- first-run `register` **dies** on a missing config file instead of
+  creating it (spec §6.6)
+- hook stdin is the whole type's clean state, no args (spec §6.4)
+- hook children inherit the epoll FD **and the listening socket** —
+  audit D1 confirmed, evidence in `hook_inherited_fds.txt`
+
+Reproducing hook captures needs the hooks dir at its hardcoded path;
+`bwrap --dev-bind / / --tmpfs /usr/share --bind <dir> /usr/share/shared-state`
+does it without root.

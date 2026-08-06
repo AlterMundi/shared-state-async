@@ -1,0 +1,19 @@
+{
+    "mTypeConf": [
+        {
+            "key": "spec_probe",
+            "value": {
+                "mName": "spec_probe",
+                "mScope": "community",
+                "mUpdateInterval": {
+                    "xint64": 30,
+                    "xstr64": "30"
+                },
+                "mBleachTTL": {
+                    "xint64": 300,
+                    "xstr64": "300"
+                }
+            }
+        }
+    ]
+}

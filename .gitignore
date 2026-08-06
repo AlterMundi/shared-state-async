@@ -42,3 +42,4 @@ covbuild/
 # Qt Creator
 CMakeLists.txt.user
 
+build/

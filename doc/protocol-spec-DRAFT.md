@@ -2,15 +2,16 @@
 
 > ## ⚠️ THIS IS A DRAFT — NOT AUTHORITATIVE ⚠️
 >
-> Status: **draft-0**, reverse-engineered from `shared-state-async`
-> C++ sources (master @ `ce8659b`) by reading code, upstream issues and
-> field notes — **not yet verified against a running binary**. Items
-> marked **⚠️UNVERIFIED** need golden-fixture capture (§10) before this
-> document can be trusted for implementation. Semantics described here
-> include known defects (kept deliberately: v1 describes what deployed
-> nodes DO, not what they should do — see §7 and `cpp-code-audit.md`).
-> Review by upstream developers — especially javierbrk and G10h4ck —
-> is the point of this draft existing.
+> Status: **draft-1**, reverse-engineered from `shared-state-async`
+> C++ sources (master @ `ce8659b`) and **verified against a running
+> binary** (gcc 14.2 Release build, x86-64) via golden-fixture capture
+> (§10, fixtures in `tests/spec-suite/fixtures/captured/`). Former
+> ⚠️UNVERIFIED items are now stamped ✅fixture-verified; capture on a
+> big-endian target is still pending (relevant only to §3's msg3 note).
+> Semantics described here include known defects (kept deliberately:
+> v1 describes what deployed nodes DO, not what they should do — see §7
+> and `cpp-code-audit.md`). Review by upstream developers — especially
+> javierbrk and G10h4ck — is the point of this draft existing.
 
 Scope: the wire protocol, payload encoding, merge/bleach semantics, and
 host-side contracts (hooks, discovery, config, stats) of the LibreMesh
@@ -57,9 +58,18 @@ client → server : ver(1)          # echo (lets server estimate RTT)
 ```
 
 - Either side receiving a version ≠ its own MUST fail the session
-  (observed behavior: log + close; enforced on both sides).
+  (observed behavior: log + close; enforced on both sides — applies to
+  messages 1 and 2 only).
 - The third message exists only so the server can estimate RTT from
   its send→echo interval; the client estimates RTT from message 1→2.
+- **✅fixture-verified surprise: msg3's byte order is platform-
+  dependent.** The C++ client applies `htonl` twice to the received
+  value before echoing, so on little-endian hosts msg3 goes out as
+  `01 00 00 00` (captured: `client1_handshake.hex`), while msgs 1–2 are
+  proper big-endian `00 00 00 01`. Harmless only because the server
+  never validates msg3 — it reads 4 bytes for timing and discards them.
+  Implementations MUST NOT validate msg3's content, and MUST NOT assume
+  its byte order. (A port should still send big-endian for hygiene.)
 - Consequence for evolution: version mismatch cleanly refuses — this is
   the negotiation-free upgrade lever (a v2 speaker cannot talk to a v1
   speaker; there is no downgrade mechanism).
@@ -161,18 +171,24 @@ On significant merge (peer daemon only): for each **executable** file in
 `/usr/share/shared-state/hooks/<typeName>/` (any order the filesystem
 yields, sequentially, awaited):
 
-- Invoked with **no arguments**, not via shell (`execvp` of the path;
-  command strings are whitespace-tokenized — paths with spaces break).
+- Invoked with **no arguments** (✅fixture-verified: `hook ran with 0
+  args`), not via shell (`execvp` of the path; command strings are
+  whitespace-tokenized — paths with spaces break).
 - **stdin** receives the *clean* aggregate state as one JSON object:
-  `{ "<key>": <mData>, ... }` (no authors, no TTLs), then EOF.
-- Exit status is read but **ignored** (audit C5); stdout is inherited
-  (⚠️UNVERIFIED: hook stdout goes to the daemon's stdout — pipe is only
-  wired for stdin? confirm against binary — the implementation dup2s
-  both ends, so hook stdout is captured but never read: a hook writing
-  more than the pipe buffer (64 KiB default) to stdout will **block
-  forever**, and with the serial daemon that hangs everything).
-- Hook processes inherit the daemon's FDs incl. the listening socket
-  (audit D1) — hooks that daemonize break daemon restart.
+  `{ "<key>": <mData>, ... }` — no authors, no TTLs — then EOF
+  (✅fixture-verified: `hook_stdin.json`; same shape as CLI `get`).
+  Note it is the **whole type's state**, not a diff of what changed.
+- Exit status is read but **ignored** (audit C5).
+- Hook **stdout is a pipe the daemon never reads** (`dup2`'d in the
+  child, parent end registered but not drained): a hook writing more
+  than the pipe buffer (64 KiB default) blocks forever, and with the
+  serial daemon (audit B1) that wedges the whole node. Hooks MUST
+  redirect their own output.
+- **✅Confirmed (audit D1)**: hook children inherit the daemon's epoll
+  FD and the **listening socket on port 3490** — captured in
+  `hook_inherited_fds.txt` (`fd 3 → anon_inode:[eventpoll]`,
+  `fd 4 → socket:[...]`). A hook that daemonizes keeps port 3490 bound
+  and blocks daemon restart.
 
 ### 6.5 Discovery
 
@@ -184,51 +200,78 @@ Any unparseable line aborts the **entire** peer list (audit F3).
 
 ### 6.6 Configuration
 
-`/tmp/shared-state/shared-state-async.conf` — JSON map of
+`/tmp/shared-state/shared-state-async.conf` — object with wrapper key
+`"mTypeConf"` holding a map-as-array of
 `typeName → {mName, mScope, mUpdateInterval, mBleachTTL}` in the
-serialization format of §6.7. Written by `register` (truncate-in-place,
-**not atomic** — audit F1); re-read by the daemon every second in two
-loops, which **erases in-memory state for types absent from a parse**.
-`mScope` is carried but currently uninterpreted by the daemon
-(⚠️UNVERIFIED — grep shows no consumer; candidate hook for per-type
-consistency policy, critique §5).
+serialization format of §6.7 (✅fixture-verified: `config_file.json`).
+Written by `register` (truncate-in-place, **not atomic** — audit F1);
+re-read by the daemon every second in two loops, which **erases
+in-memory state for types absent from a parse**. `mScope` is carried but
+uninterpreted by the daemon (candidate hook for per-type consistency
+policy, critique §5).
 
-### 6.7 Payload encoding (⚠️UNVERIFIED — capture fixtures before use)
+**✅Confirmed bootstrap defect**: `register` calls `loadRegisteredTypes`
+first, and on a missing config file that path calls
+`rs_error_bubble_or_exit` with `errbub = nullptr` → **the process dies
+before it can create the file it is meant to create**. First-run
+`register` on a clean system therefore fails with
+`F ... Failure opening config file for reading` unless the file already
+exists (workaround used for fixture capture: pre-seed
+`{"mTypeConf":[]}`). LibreMesh installs must be shipping the config file
+via package or init script for this never to have surfaced.
+
+### 6.7 Payload encoding (✅fixture-verified)
 
 The frame `data` is UTF-8 JSON produced by libretroshare's
-`RsTypeSerializer`. Its conventions (inferred from code + the JSON
-pasted in lime-packages #1105 — **must be fixture-verified**):
+`RsTypeSerializer`. Conventions, all confirmed by captured fixtures
+(`client1_request_spec_probe.json`, `server_response_spec_probe.json`)
+and by live interop (a Python-encoded slice was accepted and re-served
+by the real daemon):
 
 - The state slice is wrapped in an object under the literal key
   **`"stateSlice"`** (both directions).
 - `std::map` serializes as a JSON **array of `{"key": K, "value": V}`
-  objects** (NOT a plain JSON object). Evidence: #1105 paste.
-- `int64` fields (`mTtl`, intervals) serialize as
+  objects** (NOT a plain JSON object).
+- `int64` fields (`mTtl`, intervals, `mTS`) serialize as
   **`{"xint64": <number>, "xstr64": "<number-as-string>"}`**.
-  Evidence: #1105 paste. Both members must be emitted; which one wins
-  on read if they disagree is ⚠️UNVERIFIED.
+  **On read, `xint64` is authoritative**: a hand-crafted entry with
+  `{"xint64": 200, "xstr64": "777"}` was stored as 200 and re-emitted
+  normalized as `{"xint64": 200, "xstr64": "200"}`.
 - `StateEntry` object keys: `"mAuthor"`, `"mTtl"`, `"mData"`
   (C++ member names; a port MUST reproduce them byte-exactly).
+- An empty slice `{"stateSlice":[]}` is a valid message (used by a
+  read-only client to fetch full state; 17 bytes ≥ the 2-byte minimum).
 
-Illustrative (synthetic, unverified) slice payload:
+Captured client payload (verbatim, `insert` with
+bleachTTL=300/updateInterval=30 — note mTtl = 331 confirming the §6.3
+insert formula):
 
 ```json
 { "stateSlice": [
-    { "key": "LiMe-abc123",
-      "value": { "mAuthor": "LiMe-abc123",
-                 "mTtl": { "xint64": 2401, "xstr64": "2401" },
-                 "mData": { "hostname": "LiMe-abc123" } } }
+    { "key": "probe-key-1",
+      "value": { "mAuthor": "lenovo-i7",
+                 "mData": { "hostname": "testhost", "n": 42 },
+                 "mTtl": { "xint64": 331, "xstr64": "331" } } }
 ] }
 ```
 
-### 6.8 Statistics file (informative)
+The CLI `dump` output is the same map-as-array convention (without the
+`stateSlice` wrapper); `get` output is a plain `{key: mData}` object —
+the same shape hooks receive on stdin (§6.4).
 
-`/tmp/shared-state/network_statistics.json`: per-peer deque (max 10
-records, 30 min max age) of `{mTS, mRttExt, mUpBwMbsExt, mDownBwMbsExt}`.
-`mTS` is `steady_clock` ticks — **boot-relative, not comparable across
-reboots or nodes**. Read-modify-written on every sync; file locking is
-compile-time optional and OFF by default. Consumers: ⚠️UNVERIFIED
-(if none exist in lime-packages, v2 drops the subsystem — critique §1.2).
+### 6.8 Statistics file (informative, ✅fixture-verified)
+
+`/tmp/shared-state/network_statistics.json`: object with wrapper key
+`"stats"` holding a map-as-array keyed by **IPv4-mapped IPv6 peer
+string** (captured: `"::ffff:127.0.0.1"`), each value an array of
+`{mTS, mRttExt, mUpBwMbsExt, mDownBwMbsExt}` (max 10 records, 30 min max
+age). `mTS`/`mRttExt` use the `xint64` convention; the two bandwidth
+fields are **plain JSON numbers** (uint32). Captured `mTS` value
+`302045708748019` confirms it is raw `steady_clock` nanosecond ticks —
+**boot-relative, not comparable across reboots or nodes**.
+Read-modify-written on every sync; file locking is compile-time optional
+and OFF by default. Consumers in lime-packages: still unconfirmed
+(if none, v2 drops the subsystem — critique §1.2).
 
 ## 7. Known-defect ledger (v1)
 
@@ -338,13 +381,44 @@ every v2/v2r correctness property holds. Components:
 - **Wire codec** (`wire.py`) implementing §3–§5 byte-exactly, used to
   capture and replay golden fixtures against real binaries.
 
-Fixture-capture procedure (to clear the ⚠️UNVERIFIED markers): build the
-C++ binary, run `peer` on loopback, drive one `insert` + one `sync` with
-`wire.py` in man-in-the-middle mode, store: (1) handshake bytes,
-(2) full frame bytes both directions, (3) pretty-printed payload JSON,
-(4) config file, (5) hook stdin capture, (6) stats file. Store under
-`tests/spec-suite/fixtures/captured/` and update this document's
-UNVERIFIED markers with references.
+**Fixtures captured** (2026-08-06, gcc 14.2 Release build, x86-64;
+tool: `capture.py`, stored in `tests/spec-suite/fixtures/captured/`):
+
+| fixture | what it pins |
+|---|---|
+| `client1_handshake.{hex,json}` | real CLI handshake bytes incl. the msg3 byte-order quirk (§3) |
+| `client1_request_spec_probe.{hex,json}` | real `insert` frame + payload from the C++ client |
+| `server_response_spec_probe.{hex,json}` | real daemon response frame (408 B) |
+| `our_request_spec_probe.hex` | our encoder's frame that the daemon **accepted** |
+| `cli_dump_spec_probe.json`, `cli_get_spec_probe.json` | CLI output shapes (§6.7) |
+| `config_file.json`, `network_statistics.json` | on-disk contracts (§6.6, §6.8) |
+| `hook_stdin.json` | exact hook stdin payload (§6.4) |
+| `hook_inherited_fds.txt` | `/proc/self/fd` of a live hook child — proves audit D1 |
+
+Interop proven in both directions: `capture.py client` ran a full
+session against a live `peer` daemon and decoded its response, and an
+entry encoded by `wire.py` was accepted, merged, stored and re-served by
+the daemon (visible in `cli_dump`). Reproduce with:
+
+```
+cmake -DCMAKE_BUILD_TYPE=Release -DSS_CPPTRACE_STACKTRACE=OFF .. && make
+echo '{"mTypeConf":[]}' > /tmp/shared-state/shared-state-async.conf   # see §6.6
+./shared-state-async register spec_probe community 30 300
+./shared-state-async peer &                    # needs a shared-state-async-discover in PATH
+python3 capture.py client 127.0.0.1 spec_probe
+```
+
+Hook fixtures were captured by bind-mounting the hooks directory into
+an unprivileged namespace (no root needed):
+
+```
+bwrap --dev-bind / / --tmpfs /usr/share \
+      --bind ./hooks-dir /usr/share/shared-state \
+      ./shared-state-async peer
+```
+
+Still uncaptured: any big-endian-target capture (affects only the §3
+msg3 byte-order note).
 
 **The legacy Python client (`tests/python-testclient/`) tests the
 pre-async Lua echo protocol** — no handshake, no framing, fuzzy 0.9

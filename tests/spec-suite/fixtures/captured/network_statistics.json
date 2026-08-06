@@ -1,0 +1,69 @@
+{
+    "stats": [
+        {
+            "key": "::ffff:127.0.0.1",
+            "value": [
+                {
+                    "mTS": {
+                        "xint64": 302045708748019,
+                        "xstr64": "302045708748019"
+                    },
+                    "mRttExt": {
+                        "xint64": 117,
+                        "xstr64": "117"
+                    },
+                    "mUpBwMbsExt": 1,
+                    "mDownBwMbsExt": 1
+                },
+                {
+                    "mTS": {
+                        "xint64": 302060116538206,
+                        "xstr64": "302060116538206"
+                    },
+                    "mRttExt": {
+                        "xint64": 120,
+                        "xstr64": "120"
+                    },
+                    "mUpBwMbsExt": 1,
+                    "mDownBwMbsExt": 1
+                },
+                {
+                    "mTS": {
+                        "xint64": 302074476403405,
+                        "xstr64": "302074476403405"
+                    },
+                    "mRttExt": {
+                        "xint64": 52,
+                        "xstr64": "52"
+                    },
+                    "mUpBwMbsExt": 1,
+                    "mDownBwMbsExt": 1
+                },
+                {
+                    "mTS": {
+                        "xint64": 302074476628903,
+                        "xstr64": "302074476628903"
+                    },
+                    "mRttExt": {
+                        "xint64": 77,
+                        "xstr64": "77"
+                    },
+                    "mUpBwMbsExt": 1,
+                    "mDownBwMbsExt": 1
+                },
+                {
+                    "mTS": {
+                        "xint64": 302074572455374,
+                        "xstr64": "302074572455374"
+                    },
+                    "mRttExt": {
+                        "xint64": 92,
+                        "xstr64": "92"
+                    },
+                    "mUpBwMbsExt": 1,
+                    "mDownBwMbsExt": 1
+                }
+            ]
+        }
+    ]
+}

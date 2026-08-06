@@ -1,0 +1,42 @@
+[
+    {
+        "key": "conflict-probe",
+        "value": {
+            "mAuthor": "spec-suite",
+            "mTtl": {
+                "xint64": 186,
+                "xstr64": "186"
+            },
+            "mData": {
+                "t": 1
+            }
+        }
+    },
+    {
+        "key": "probe-key-1",
+        "value": {
+            "mAuthor": "lenovo-i7",
+            "mTtl": {
+                "xint64": 284,
+                "xstr64": "284"
+            },
+            "mData": {
+                "hostname": "testhost",
+                "n": 42
+            }
+        }
+    },
+    {
+        "key": "probe-key-2",
+        "value": {
+            "mAuthor": "spec-suite",
+            "mTtl": {
+                "xint64": 222,
+                "xstr64": "222"
+            },
+            "mData": {
+                "origin": "python-codec"
+            }
+        }
+    }
+]

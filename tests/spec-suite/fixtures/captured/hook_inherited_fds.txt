@@ -1,0 +1,7 @@
+total 0
+lr-x------ 1 fede fede 64 Aug  6 18:35 0 -> pipe:[13285715]
+l-wx------ 1 fede fede 64 Aug  6 18:35 1 -> /tmp/claude-1000/-home-fede-REPOS/a6a9d024-1758-439f-834d-aea851a42d5b/scratchpad/hook_fds.txt
+l-wx------ 1 fede fede 64 Aug  6 18:35 2 -> /tmp/claude-1000/-home-fede-REPOS/a6a9d024-1758-439f-834d-aea851a42d5b/scratchpad/hook_fds.txt
+lrwx------ 1 fede fede 64 Aug  6 18:35 3 -> anon_inode:[eventpoll]
+lrwx------ 1 fede fede 64 Aug  6 18:35 4 -> socket:[13271989]
+lr-x------ 1 fede fede 64 Aug  6 18:35 5 -> /proc/2842951/fd

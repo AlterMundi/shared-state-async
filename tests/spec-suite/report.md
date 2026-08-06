@@ -252,5 +252,5 @@
 ## Verdict
 
 - failures: **0**
-- wall time: 3.0s
+- wall time: 1.8s
 - consistency engaged: **YES**

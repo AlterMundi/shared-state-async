@@ -1,0 +1,18 @@
+{
+ "stateSlice": [
+  {
+   "key": "probe-key-1",
+   "value": {
+    "mAuthor": "lenovo-i7",
+    "mData": {
+     "hostname": "testhost",
+     "n": 42
+    },
+    "mTtl": {
+     "xint64": 331,
+     "xstr64": "331"
+    }
+   }
+  }
+ ]
+}
